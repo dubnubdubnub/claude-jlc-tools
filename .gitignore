@@ -1,0 +1,10 @@
+# Skill-local artefacts that should never ship in the plugin
+**/jlc2kicad-venv/
+**/__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
