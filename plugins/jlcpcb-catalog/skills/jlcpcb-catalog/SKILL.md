@@ -69,7 +69,7 @@ No auth, no key, no observed rate limit. `componentLibraryType`: `""` = both, `"
 
 ## Mode 1: Direct lookup — `Search-Jlc`, `Get-JlcByCode`
 
-Load the helpers (works whether the skill is in `~/.claude/skills/` or `~/.claude/plugins/cache/.../jlcpcb-catalog/`, and avoids ExecutionPolicy issues):
+**Load the helpers — paste this exact block.** Works for legacy `~/.claude/skills/` and plugin-cache layouts, dodges ExecutionPolicy, and reads the file as UTF-8 (PS 5.1 default codepage will mangle the Chinese descriptions in helper output otherwise):
 
 ```powershell
 $helperPath = @(
@@ -77,8 +77,10 @@ $helperPath = @(
     (Get-ChildItem "$HOME\.claude\plugins\cache" -Recurse -Filter helper.ps1 -ErrorAction SilentlyContinue |
      Where-Object { $_.FullName -like '*jlcpcb-catalog*' } | Select-Object -First 1 -ExpandProperty FullName)
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-Get-Content $helperPath -Raw | Invoke-Expression
+Invoke-Expression ([IO.File]::ReadAllText($helperPath, [Text.Encoding]::UTF8))
 ```
+
+**Do not use `. helper.ps1` (dot-source).** Windows PowerShell's default ExecutionPolicy will block it with `UnauthorizedAccess`. The `Invoke-Expression` form above bypasses the policy because it's executing a string, not a script file.
 
 Then:
 
@@ -89,7 +91,9 @@ Get-JlcByCode 'C25744'                        # same, terser
 Search-JlcPassive -Mpn 'RC0402FR-0710KL'      # parametric MPN, Basic-first
 ```
 
-For a one-shot from Bash without PowerShell:
+**On Windows, prefer PowerShell over the Bash tool for these calls.** The Bash sandbox on Windows has been seen to route JSON-bodied curl POSTs through the Microsoft Store python stub for unclear reasons, killing the call with `exit 49 / Python was not found`. PowerShell's `Invoke-RestMethod` (wrapped by `Search-Jlc`) doesn't have this problem.
+
+If you must use Bash (Linux/Mac, or a working Windows shell):
 
 ```bash
 curl -s -H "Content-Type: application/json" -X POST \
@@ -97,6 +101,15 @@ curl -s -H "Content-Type: application/json" -X POST \
   "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList" \
   | grep -oE '"(componentCode|componentLibraryType|stockCount|componentModelEn)":"?[^",]*"?'
 ```
+
+### Keyword tuning
+
+The API's `keyword` field is fuzzy text matching, not parametric search. Lessons from real runs:
+
+- **Multi-token queries with spaces often return zero** — `"40MHz 3225"` matched nothing, `"40MHz"` alone got hits. Search one strong token at a time.
+- **For passives with no exact MPN, the Chinese category term sometimes works better** than English — `晶振` (crystal), `电容` (cap), `电阻` (resistor), `贴片` (SMD).
+- **MPN-family prefix matching** is reliable — `"X322540"` finds all YXC X3225-series 40 MHz parts whether or not their full SKU code is in your memory.
+- **Parametric strings like `"10K 0402"` are unreliable** even with `-Library base` — they return whatever Basic Part is most popular overall (often a 100nF cap). Use the offline catalog (Mode 2) or specific manufacturer MPNs.
 
 ### When to fetch the LCSC product page directly
 
@@ -151,38 +164,58 @@ When the user asks for a component by criteria rather than name, spawn a `genera
 ### Subagent prompt template
 
 ```
-You have access to JLCPCB's component-search JSON API for parametric sourcing.
-No auth required.
+You have access to JLCPCB's component-search JSON API for parametric sourcing
+via the jlcpcb-catalog skill's PowerShell helper. No auth required.
 
-Endpoint:
-  POST https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/smtGood/selectSmtComponentList
-  Content-Type: application/json
-  Body: {"keyword":"<query>","currentPage":1,"pageSize":20,"componentLibraryType":""}
+LOAD THE HELPER FIRST. Run this in PowerShell exactly:
 
-componentLibraryType: "" = all, "base" = JLCPCB Basic Parts only (no $3 setup fee).
+  $helperPath = @(
+      "$HOME\.claude\skills\jlcpcb-catalog\helper.ps1",
+      (Get-ChildItem "$HOME\.claude\plugins\cache" -Recurse -Filter helper.ps1 -ErrorAction SilentlyContinue |
+       Where-Object { $_.FullName -like '*jlcpcb-catalog*' } | Select-Object -First 1 -ExpandProperty FullName)
+  ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+  Invoke-Expression ([IO.File]::ReadAllText($helperPath, [Text.Encoding]::UTF8))
 
-Response: data.componentPageInfo.list[] of {componentCode, componentLibraryType,
-stockCount, componentBrandEn, componentModelEn, erpComponentName, componentPrices,
-preferredComponentFlag, leastPatchNumber, dataManualUrl}.
+DO NOT use `. helper.ps1` (dot-source) — Windows ExecutionPolicy blocks it.
+DO NOT use the Bash tool with curl on Windows — JSON-bodied POSTs sometimes
+get routed through the Microsoft Store python stub and fail with exit 49.
+PowerShell with `Invoke-RestMethod` (already wrapped by Search-Jlc) works.
 
-GOAL: <SPEC GOES HERE — what we're looking for>
+After the helper loads you have:
+  Search-Jlc -Keyword '<query>' [-Library base|expand|''] [-PageSize N]
+  Get-JlcByCode '<C-number>'
+
+Each returns objects with: Code, Lib (base/expand), Stock, Brand, MPN, Desc,
+Price1 (1-tier price), Pref (preferred flag), MinAsm (min board count),
+DataSheet (PDF URL), ExactMatch (true if MPN/code matches keyword exactly).
+
+GOAL: <SPEC GOES HERE — what you're looking for>
 
 CONSTRAINTS:
 - Package: <e.g., 0805 or smaller>
-- Spec: <e.g., 6V breakdown, ≥1A peak>
+- Spec: <e.g., 6V breakdown, >=1A peak>
 - Prefer: JLCPCB Basic over Extended; in stock (>1000 units); low cost
-- Avoid: parts with leastPatchNumber > 50 unless nothing else qualifies
+- Avoid: parts with MinAsm > 50 unless nothing else qualifies
 
 WORKFLOW:
-1. Build a keyword query from the spec. For parametric searches, try
-   manufacturer MPN families (e.g., for ESD diodes: PESD, SMF, ESDA series).
-2. Run the search via curl. Sort results by Basic-first then stock.
-3. For each promising candidate, fetch the LCSC product detail page at
-   https://www.lcsc.com/product-detail/{componentCode}.html (use a real
-   browser User-Agent like Mozilla/5.0 - it returns full SSR HTML).
-   Verify the parametric spec from the page or from the dataManualUrl PDF.
-4. Reject candidates that don't meet the constraints. Iterate with new
-   keywords if needed (try 2-3 search variations).
+1. Build keyword(s) from the spec. The API does fuzzy text matching, NOT
+   parametric, so:
+   - SINGLE TOKENS work better than multi-token queries with spaces:
+     "40MHz" matches, "40MHz 3225" returns zero.
+   - Manufacturer MPN family prefixes are reliable:
+     ESD diodes -> "PESD", "SMF", "ESDA"; crystals -> "X3225", "X2520";
+     resistors -> "RC0402", "0402WGF"; caps -> "CL05", "CC0402".
+   - Chinese category terms sometimes hit when English doesn't:
+     `晶振` (crystal), `电容` (cap), `电阻` (resistor), `贴片` (SMD).
+2. Sort and rank: ExactMatch first, then Basic over Extended, then Pref,
+   then higher Stock.
+3. Verify shortlist of 2-4 candidates. For deep parametric specs (ESR,
+   tempco, AEC-Q200), fetch the LCSC product detail page:
+     https://www.lcsc.com/product-detail/{Code}.html
+   Use a browser User-Agent (Mozilla/5.0 ...). The page is SSR; full HTML
+   has the parametric tables.
+4. Reject candidates that miss spec. If everything fails, broaden the
+   keyword (drop a token) and retry, but no more than 8 API calls total.
 5. Return EXACTLY this JSON, nothing else:
 
 {
@@ -199,14 +232,17 @@ WORKFLOW:
   "alternates": [
     {"code": "...", "mpn": "...", "library": "...", "why": "..."}
   ],
-  "rejected_examples": ["MPN — reason rejected", ...]
+  "rejected_examples": ["MPN -- reason rejected", ...]
 }
 
-Keep your search to ≤6 API calls. If nothing qualifies, return picked: null
-and explain why in alternates[0].why.
+Keep your search to <=8 API calls (and a couple of LCSC page fetches if
+needed). The cap is to force convergence, not because of any rate limit.
+If nothing qualifies, return picked: null and explain in alternates[0].why.
 ```
 
 When invoking, fill `<SPEC GOES HERE>` and `CONSTRAINTS` with the user's actual ask. Pass via `Agent` tool with `subagent_type: "general-purpose"`.
+
+**Note on the API-call cap.** It's a heuristic to keep the subagent's work bounded, not a JLCPCB rate limit (no rate limit observed). Six API calls is enough for: 1-2 broad searches, 3-4 candidate-verifies, 1-2 datasheet fetches. Bumping to 8-10 makes sense for harder spec searches; budgets above 15 usually mean the keyword strategy is wrong.
 
 ## Common gotchas
 

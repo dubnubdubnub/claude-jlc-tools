@@ -10,7 +10,7 @@
       "name": "jlcpcb-catalog",
       "source": "./plugins/jlcpcb-catalog",
       "description": "Query JLCPCB / LCSC parts catalog via the public JSON API. Resolve MPNs to LCSC C-numbers, check Basic-vs-Extended status and stock, fetch datasheets, and source parts by spec.",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": {
         "name": "Isaac Chiu"
       },
